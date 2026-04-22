@@ -311,6 +311,13 @@ workload. In these cases, the preempted workload would always be lower priority 
 that is being resized, so we consider this working as intended.
 
 
+#### Race between a Deferred resize and a new higher-priority pod
+
+From the scheduler's view, once the spec is updated, the resources are already reserved. It doesn't matter from the scheduler perspective whether the resize has been actuated by the Kubelet yet.
+
+This means that if a new, higher-priority pod comes in and the only way to fit it is by taking the space the Deferred pod is trying to grow into, the standard preemption logic applies. This might mean the resizing pod itself gets evicted if it’s the best victim candidate. While we would rather not kill pods unnecessarily, this behavior is consistent with the rest of the scheduler's logic.
+
+
 ## Design Details
 
 <!--
@@ -322,9 +329,13 @@ proposal will be implemented, this is the place to discuss them.
 
 ### How Deferred Resizes will integrate into the Scheduling Queue
 
-In the [UpdatePod event handler](https://github.com/kubernetes/kubernetes/blob/60433d43cf0bb83a2ac7d5e767137b3d510026ec/pkg/scheduler/eventhandlers.go#L147) that the Scheduler already has, the Scheduler will check to see if a pod has recently been marked as having a `Deferred` resize. If so, the pod will be added to the scheduling queue.
+In the [UpdatePod event handler](https://github.com/kubernetes/kubernetes/blob/60433d43cf0bb83a2ac7d5e767137b3d510026ec/pkg/scheduler/eventhandlers.go#L147) that the Scheduler already has, the Scheduler will check to see if a pod has recently been marked as having a `Deferred` resize. If so, the pod will be added to the scheduling queue. 
 
-The scheduling queue will now be shared between new pods and `Deferred` pods, using existing queuing logic to sort them by their current scheduling priority.
+The scheduling queue will be shared between new pods and `Deferred` pods, using existing queuing logic to sort them by their current scheduling priority. 
+
+The `UpdatePod` event handler will also watch for:
+* **If the pod's resources changed from last time**: We need to update our view of the pod, and move it to the active queue if it is not there already.
+* **If the deferred condition is removed**: We will remove it from whatever queue it's currently in.
 
 *See alternative considerations for separate scheduling queues [here](#separate-scheduling-queue) and prioritized resize logic [here](#implementing-prioritized-resizes-logic).*
 
@@ -476,8 +487,10 @@ behavior for new pods. This means:
 
 #### ResizeUnschedulable Pod Condition
 
-The Scheduler will own a new `ResizeUnschedulable` condition type in the pod status. This condition will be present only after
-a preemption attempt fails. For example: 
+The Scheduler will own a new `ResizeUnschedulable` condition type in the pod status, set by the core scheduler as part
+of handling scheduling failures.
+
+This condition will be present only after a preemption attempt fails. For example: 
 
 ```yaml
 status:
