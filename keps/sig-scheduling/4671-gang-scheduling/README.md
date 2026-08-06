@@ -231,7 +231,7 @@ The `Workload` API defines the scheduling policy and references one or more `pod
 is a standalone runtime object created from those templates, representing a self-contained scheduling unit that 
 encapsulates the runtime state.
 
-In v1.37, the API will be promoted to `v1beta1`. At the same time, a new `v1alpha3` version will be created
+In v1.37, the API was promoted to `v1beta1`. At the same time, a new `v1alpha3` version was created
 to replace `v1alpha2`, enabling backward-incompatible changes around `DisruptionMode` for planned alpha features.
 
 The `spec.schedulingGroup` on the Pod object is used to identify the scheduling context, which is the runtime `PodGroup`.
@@ -243,9 +243,8 @@ apiVersion: v1
 kind: Pod
 spec:
   ...
-  # In 1.36 schedulingGroup replaces workloadRef.
   schedulingGroup:
-    podGroupName: pg1  # Points to the standalone PodGroup object
+    podGroupName: pg1
   ...
 ```
 
@@ -292,10 +291,8 @@ metadata:
   namespace: ns-1
   name: job-1
 spec:
-  # In 1.36 (v1alpha2) renamed from podGroups to podGroupTemplates.
   podGroupTemplates:
     - name: "worker"
-      # In 1.36 (v1alpha2) renamed from policy to schedulingPolicy.
       schedulingPolicy:
         gang:
           minCount: 100
@@ -308,10 +305,9 @@ kind: PodGroup
 metadata:
   name: training-worker-0
 spec:
-  podGroupTemplateRef:
-    workload:
-      workloadName: training-policy
-      podGroupTemplateName: worker
+  workloadRef:
+    workloadName: training-policy
+    templateName: worker
   schedulingPolicy:
     gang:
       minCount: 100
@@ -429,24 +425,24 @@ the above conventions.
 
 ### Associating Pod into PodGroups
 
-We propose introducing a `SchedulingGroup` field in `PodSpec` (replacing the previous `WorkloadReference`) to link
+We propose introducing a `SchedulingGroup` field in `PodSpec` to link
 the `Pod` to its scheduling context.
 
 ```go
 type PodSpec struct {
 	...
 	
-    // WorkloadRef is tombstoned since the field in 1.36 was replaced with SchedulingGroup.
-    // WorkloadRef *WorkloadReference
-	
-	// SchedulingGroup provides a reference to the immediate scheduling runtime grouping object that this Pod 
-	// belongs to. In the current implementation, this is always a PodGroup, but it may evolve in the future to support
-	// other concepts like PodSubGroups.
-	// This field is used by the scheduler to identify the PodGroup and apply the
-	// correct group scheduling policies. The PodGroup object referenced
-	// by this field may not exist at the time the Pod is created.
-	// This field is immutable, but a PodGroup object with the same name
-	// may be recreated with different policies. Doing this during pod scheduling
+	// SchedulingGroup provides a reference to the immediate scheduling runtime
+	// grouping object that this Pod belongs to.
+	// This field is used by the scheduler to identify the group and apply the
+	// correct group scheduling policies. The association with a group also
+	// impacts other lifecycle aspects of a Pod that are relevant in a wider context
+	// of scheduling like preemption, resource attachment, etc. If not specified,
+	// the Pod is treated as a single unit in all of these aspects.
+	// The group object referenced by this field may not exist at the time the
+	// Pod is created.
+	// This field is immutable, but a group object with the same name may be
+	// recreated with different policies. Doing this during pod scheduling
 	// may result in the placement not conforming to the expected policies.
 	//
 	// +featureGate=GenericWorkload
@@ -454,14 +450,18 @@ type PodSpec struct {
 	SchedulingGroup *PodSchedulingGroup
 }
 
-// PodSchedulingGroup identifies the runtime scheduling group instance that a Pod belongs to. 
+// PodSchedulingGroup identifies the runtime scheduling group instance that a Pod belongs to.
 // The scheduler uses this information to apply workload-aware scheduling semantics.
+// Exactly one field must be specified.
+// +union
 type PodSchedulingGroup struct {
-    // PodGroupName specifies the name of the standalone PodGroup object 
-    // that represents the runtime instance of this group.
-    // +optional
-    // +oneOf=GroupSelection
-    PodGroupName *string `json:"podGroupName,omitempty"`
+	// PodGroupName specifies the name of the standalone PodGroup object
+	// that represents the runtime instance of this group.
+	// Must be a DNS subdomain.
+	//
+	// +optional
+	// +oneOf=GroupSelection
+	PodGroupName *string
 }
 ```
 
@@ -517,10 +517,9 @@ kind: PodGroup
 metadata:
   name: job-instance-worker-0
 spec:
-  podGroupTemplateRef:
-    workload:
-      workloadName: jobset
-      podGroupTemplateName: job-1
+  workloadRef:
+    workloadName: jobset
+    templateName: job-1
   # schedulingPolicy is copied from template on PodGroup creation.
   schedulingPolicy:
     gang:
@@ -554,7 +553,7 @@ to identify pods belonging to it. However, with this pattern:
 - for replicated gang, we can't use the full label selector, but rather support specifying only the
   label key, similar to `MatchLabelKeys` in pod affinity
 
-Decoupling `Workload` from `PodGroup` (in 1.36) clearly separates the role of a `PodGroup` (runtime grouping, 
+Decoupling `Workload` from `PodGroup` clearly separates the role of a `PodGroup` (runtime grouping, 
 status and scheduling policy) from its template (`Workload`). We decided on this approach because it 
 improves etcd scalability (sharding status updates across `PodGroup` objects) and clarifies object 
 lifecycle management as described in the original design [^4].
@@ -582,26 +581,27 @@ type Workload struct {
 	Spec WorkloadSpec
 }
 
-// WorkloadMaxPodGroups is the maximum number of pod groups per Workload.
-const WorkloadMaxPodGroups = 8
+// WorkloadMaxPodGroupTemplates is the maximum number of pod group templates per Workload.
+const WorkloadMaxPodGroupTemplates = 8
 
 // WorkloadSpec defines the templates for pod groups within a workload.
 type WorkloadSpec struct {
-    // ControllerRef is an optional reference to the controlling object, such as a
-    // Deployment or Job. This field is intended for use by tools like CLIs
-    // to provide a link back to the original workload definition.
-    // When set, it cannot be changed.
-    //
-    // +optional
-    ControllerRef *TypedLocalObjectReference
-    
-    // PodGroupTemplates is the list of templates that make up the Workload.
-    // The maximum number of podGroupTemplates is 8. This field is immutable.
-    //
-    // +optional
-    // +listType=map
-    // +listMapKey=name
-    PodGroupTemplates []PodGroupTemplate
+	// ControllerRef is an optional reference to the controlling object, such as a
+	// Deployment or Job. This field is intended for use by tools like CLIs
+	// to provide a link back to the original workload definition.
+	// This field is immutable.
+	//
+	// +optional
+	ControllerRef *TypedLocalObjectReference
+
+	// PodGroupTemplates is the list of templates that make up the Workload.
+	// The maximum number of templates is 8. Templates cannot be added or removed after the workload is created.
+	// Existing templates may still be updated where their individual fields allow it.
+	//
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	PodGroupTemplates []PodGroupTemplate
 }
 
 // TypedLocalObjectReference allows to reference typed object inside the same namespace.
@@ -627,34 +627,35 @@ type TypedLocalObjectReference struct {
 
 // PodGroupTemplate represents a template for a set of pods with a scheduling policy.
 type PodGroupTemplate struct {
-    // Name is a unique identifier for the PodGroupTemplate within the Workload.
-    // It must be a DNS label. This field is immutable.
-    //
-    // +required
-    Name string
-    
-    // SchedulingPolicy defines the scheduling policy for this PodGroupTemplate.
-    //
-    // +required
-    SchedulingPolicy PodGroupSchedulingPolicy
+	// Name is a unique identifier for the PodGroupTemplate within the Workload.
+	// It must be a DNS label. This field is immutable.
+	//
+	// +required
+	Name string
+
+	// SchedulingPolicy defines the scheduling policy for this PodGroupTemplate.
+	//
+	// +required
+	SchedulingPolicy PodGroupSchedulingPolicy
 }
 
 // PodGroupSchedulingPolicy defines the scheduling configuration for a PodGroup.
 // Exactly one policy must be set.
 type PodGroupSchedulingPolicy struct {
-    // Basic specifies that the pods in this group should be scheduled using
-    // standard Kubernetes scheduling behavior.
-    //
-    // +optional
-    // +oneOf=PolicySelection
-    Basic *BasicSchedulingPolicy
-    
-    // Gang specifies that the pods in this group should be scheduled using
-    // all-or-nothing semantics.
-    //
-    // +optional
-    // +oneOf=PolicySelection
-    Gang *GangSchedulingPolicy
+	// Basic specifies that the pods in this group should be scheduled using
+	// standard Kubernetes scheduling behavior. Setting this field at group creation time
+	// opts this group to basic scheduling; this field cannot be changed afterward.
+	//
+	// +optional
+	Basic *BasicSchedulingPolicy
+
+	// Gang specifies that the pods in this group should be scheduled using
+	// all-or-nothing semantics. Setting this field at group creation time
+	// opts this group to gang scheduling; this field cannot be set or unset afterward.
+	// The minCount field within Gang scheduling policy remains mutable after group creation.
+	//
+	// +optional
+	Gang *GangSchedulingPolicy
 }
 
 // BasicSchedulingPolicy indicates that standard Kubernetes
@@ -695,82 +696,81 @@ The `PodGroup` resource is a separate API object in `scheduling.k8s.io/v1beta1`:
 // Workload.podGroupTemplates.
 // PodGroup API enablement is toggled by the GenericWorkload feature gate.
 type PodGroup struct {
-    metav1.TypeMeta
-    
-    // Standard object's metadata.
-    // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
-    //
-    // +optional
-    metav1.ObjectMeta
-    
-    // Spec defines the desired state of the PodGroup.
-    // +required
-    Spec PodGroupSpec
-    
-    // Status represents the current observed state of the PodGroup.
-    // +optional
-    Status PodGroupStatus
+	metav1.TypeMeta
+	// Standard object's metadata.
+	//
+	// +optional
+	metav1.ObjectMeta
+
+	// Spec defines the desired state of the PodGroup.
+	//
+	// +required
+	Spec PodGroupSpec
+
+	// Status represents the current observed state of the PodGroup.
+	//
+	// +optional
+	Status PodGroupStatus
 }
 
 // PodGroupSpec defines the desired state of a PodGroup.
 type PodGroupSpec struct {
-    // PodGroupTemplateRef references the PodGroupTemplate within the Workload object that was used to create
-    // the PodGroup.
-    //
-    // +optional
-    PodGroupTemplateRef *PodGroupTemplateReference
-    
-    // SchedulingPolicy defines the scheduling policy for this instance of the PodGroup.
-    // Controllers are expected to fill this field by copying it from a PodGroupTemplate.
-    // This field is immutable.
-    //
-    // +required
-    SchedulingPolicy *PodGroupSchedulingPolicy
+	// WorkloadRef references an optional PodGroup template within the Workload
+	// object that was used to create the PodGroup.
+	// This field is immutable.
+	//
+	// +optional
+	WorkloadRef *WorkloadReference
+
+	// SchedulingPolicy defines the scheduling policy for this instance of the PodGroup.
+	// Controllers are expected to fill this field by copying it from a PodGroupTemplate.
+	//
+	// +required
+	SchedulingPolicy PodGroupSchedulingPolicy
 }
 
 // PodGroupStatus represents information about the status of a pod group.
 type PodGroupStatus struct {
-    // Conditions represent the latest observations of the PodGroup's state.
-    //
-    // Known condition types:
-    // - "PodGroupInitiallyScheduled": Indicates whether the scheduling requirement has been satisfied.
-    //   Once this condition transitions to True, it serves as a terminal state and will never revert to False,
-    //   even if pods are subsequently evicted and group constraints are no longer met.
-    // - "DisruptionTarget": Indicates whether the PodGroup is about to be terminated
-    //   due to disruption such as preemption.
-    //
-    // Known reasons for the PodGroupInitiallyScheduled condition:
-    // - "Unschedulable": The PodGroup cannot be scheduled due to resource constraints,
-    //   affinity/anti-affinity rules, or insufficient capacity for the gang.
-    // - "SchedulerError": The PodGroup cannot be scheduled due to some internal error
-    //   that happened during scheduling, for example due to nodeAffinity parsing errors.
-    //
-    // Known reasons for the DisruptionTarget condition:
-    // - "PreemptionByScheduler": The PodGroup was preempted by the scheduler to make room for
-    //   higher-priority PodGroups or Pods.
-    //
-    // +optional
-    Conditions []metav1.Condition
+	// Conditions represent the latest observations of the PodGroup's state.
+	//
+	// Known condition types:
+	// - "PodGroupInitiallyScheduled": Indicates whether the scheduling requirement has been satisfied.
+	//   Once this condition transitions to True, it serves as a terminal state and will never revert to False,
+	//   even if pods are subsequently evicted and group constraints are no longer met.
+	// - "DisruptionTarget": Indicates whether the PodGroup is about to be terminated
+	//   due to disruption such as preemption.
+	//
+	// Known reasons for the PodGroupInitiallyScheduled condition:
+	// - "Unschedulable": The PodGroup cannot be scheduled due to resource constraints,
+	//   affinity/anti-affinity rules, or insufficient capacity for the gang.
+	// - "SchedulerError": The PodGroup cannot be scheduled due to some internal error
+	//   that happened during scheduling, for example due to nodeAffinity parsing errors.
+	//
+	// Known reasons for the DisruptionTarget condition:
+	// - "PreemptionByScheduler": The PodGroup was preempted by the scheduler to make room for
+	//   higher-priority PodGroups or Pods.
+	//
+	// +optional
+	Conditions []metav1.Condition
 }
 
-// PodGroupTemplateReference references a PodGroup template defined in some object (e.g. Workload).
-// Exactly one reference must be set.
-type PodGroupTemplateReference struct {
-    // Workload references the PodGroupTemplate within the Workload object that was used to create
-    // the PodGroup.
-    // +optional
-    Workload *WorkloadPodGroupTemplateReference
-}
+// WorkloadReference references the Workload object together with the template
+// that was used to create a particular PodGroup.
+type WorkloadReference struct {
+	// WorkloadName is the name of the Workload object that contains a template
+	// that was used when creating a pod group. It must
+	// be a DNS name.
+	// This field is required.
+	//
+	// +required
+	WorkloadName string
 
-// WorkloadPodGroupTemplateReference references the PodGroupTemplate within the Workload object.
-type WorkloadPodGroupTemplateReference struct {
-    // WorkloadName defines the name of the Workload object.
-    // +required
-    WorkloadName string
-
-    // PodGroupTemplateName defines the PodGroupTemplate name within the Workload object.
-    // +required
-    PodGroupTemplateName string
+	// TemplateName is the name of a template within the Workload object that
+	// was used to create a pod group. It must be a DNS label.
+	// This field is required.
+	//
+	// +required
+	TemplateName string
 }
 ```
 
@@ -781,7 +781,7 @@ where a controller creates a standalone `PodGroup` instance for each replica (co
 a leader and its workers) to form an atomic scheduling and runtime unit. If the underlying user 
 intention is to have multiple groups run together, they should use the future hierarchical model.
 
-Note: Similarly to `PodSchedulingGroup`, all fields in `PodGroupTemplateReference` and `PodGroupTemplateRef` field
+Note: Similarly to `PodSchedulingGroup`, all fields in `WorkloadRef` field
 itself are intentionally made optional. The validation logic for those fields being set will be implemented
 in the code to allow for extending this structure if needed in the future.
 
@@ -823,7 +823,7 @@ to support beta and GA of this feature. However, future extensions to the status
 #### Implementation Notes (Alpha)
 
 - **Synchronous status updates**: Status updates are performed synchronously within the scheduling 
-cycle. Asynchronous updates will be explored once the `AsyncAPICalls` scheduler feature is available.
+cycle. Asynchronous updates will be explored once the `SchedulerAsyncAPICalls` feature is available.
 - **Strategic merge patch**: Status updates use `StrategicMergePatch` (not Server-Side Apply) to 
 match the approach used for pod status updates in the scheduler and avoid the performance overhead 
 of SSA in core controllers.
@@ -927,9 +927,9 @@ pods that reference them.
 ### Pod Group minCount Mutability
 
 To support workload scaling (e.g. for elastic Jobs), the `minCount` field in both `PodGroup`
-and `PodGroupTemplate` is proposed to be mutable in v1.37. Specifically:
+and `PodGroupTemplate` is mutable. Specifically:
 
-* Modifying a `PodGroupTemplate` will not affect existing `PodGroup` instances.
+* Modifying a `PodGroupTemplate` doesn't affect existing `PodGroup` instances.
   Changes should apply exclusively to new instances created from the updated template by the controllers.
 
 * In case of `PodGroup` instances, updates to `minCount` may not be immediately visible, as the scheduler
@@ -941,7 +941,7 @@ and `PodGroupTemplate` is proposed to be mutable in v1.37. Specifically:
   will not affect already-scheduled pods, applying only to those evaluated in future scheduling cycles.
 
 While broader PodGroup spec mutability, such as modifying the number of `PodGroupTemplates` in a `Workload`,
-may be desirable, we are strictly scoping API mutability in v1.37 to the `minCount` field.
+may be desirable, we are strictly scoping API mutability in this KEP to the `minCount` field.
 Further relaxation of validation rules will be considered in the future if driven by strong use cases.
 
 ### Workload Controllers Integration
@@ -1255,20 +1255,32 @@ The list and configuration of plugins used by this algorithm will be the same as
    // PlacementFeasiblePlugin is an interface for plugins that are called after each pod in a pod group is evaluated.
    // It is used to determine if a pod group is schedulable, may become schedulable or will not become schedulable regardless of the scheduling result of the remaining pods in the pod group.
    type PlacementFeasiblePlugin interface {
-      fwk.Plugin
+	   fwk.Plugin
 
-      // PlacementFeasible is called after each pod in a pod group is evaluated.
-      // Use placementCycleState to accumulate the results from the evaluated pods in current cycle.
-      // Return Unschedulable status if the pod group cannot be scheduled in the current state, but may become schedulable once more pods are evaluated.
-      // Return UnschedulableAndUnresolvable status if the pod group cannot be scheduled in the current state and will never become schedulable.
-      // Return Success status if the pod group can be scheduled in the current state.
-      // After returning Success, the plugin should keep returning Success for the remaining pods.
-      PlacementFeasible(ctx context.Context, placementCycleState fwk.PlacementCycleState, podGroupInfo fwk.PodGroupInfo) *fwk.Status
+     // PlacementFeasible is called after each pod in a pod group is evaluated.
+     // placementProgress contains information that plugins might additionally need when determining whether pod group scheduling placement is feasible.
+     // Return Wait status if the pod group cannot be scheduled in the current partially evaluated placement, but may become schedulable once more pods are evaluated.
+     // Return Unschedulable status if the pod group cannot be scheduled in the current placement.
+     // The scheduler will give up this placement and won't even evaluate remaining pods. The placement will remain eligible for preemption.
+     // Return Success status if the pod group can be scheduled in the current partially evaluated placement.
+     // After returning Success, the plugin should keep returning Success for the remaining pods.
+     PlacementFeasible(ctx context.Context, placementCycleState fwk.PlacementCycleState, podGroupInfo fwk.PodGroupInfo, placementProgress PlacementProgress) *fwk.Status
+   }
+
+   // PlacementProgress contains information that plugins implementing the PlacementFeasiblePlugin
+   // interface might additionally need when determining whether pod group scheduling placement is feasible.
+   type PlacementProgress struct {
+     // Remaining is the number of children that have not been evaluated yet in the current scheduling cycle. For pod groups, this is the number of unscheduled pods.
+     Remaining int
+     // Scheduled is the number of children scheduled so far in the current pod group scheduling cycle
+     // for a particular (composite) pod group and placement. For a pod group the field includes the pods that are assigned
+     // or assumed in the current PodGroup scheduling cycle.
+     Scheduled int
    }
    ```
-   To be compatible with topology-aware scheduling, the extension point will be defined at the `Placement` level.
+   To be compatible with topology-aware scheduling, the extension point is defined at the `Placement` level.
    
-   The `PlacementFeasible` will be called after each pod being evaluated during the Workload Scheduling Cycle
+   The `PlacementFeasible` is called after each pod being evaluated during the Workload Scheduling Cycle
    (during step 4. of the algorithm above), regardless of whether the pod succeeded or not.
    This check is expected to support two modes:
 
@@ -1276,7 +1288,7 @@ The list and configuration of plugins used by this algorithm will be the same as
      e.g., if the `minCount` pods from a pod group was successfully scheduled.
 
    * Feasibility (fast rejection path): Given the number of pods that have already failed scheduling in this cycle,
-     check whether is it still *possible* to meet the constraint. If not, the cycle should abort early
+     check whether it is still *possible* to meet the constraint. If not, the cycle should abort early
      to save time.
 
 While this algorithm might be suboptimal, it is a solid first step for ensuring we have
@@ -1401,9 +1413,9 @@ Initially, the KEP was introduced with two feature gates: `GenericWorkload` and 
 We identified that such a split is artificial and enabling only `GenericWorkload`
 might provide unclear results (as it enables the entire API but only a subset of kube-scheduler functionalities).
 
-In v1.37, both feature gates will be merged into one: `GenericWorkload`. Moreover, since workload-aware preemption
+In v1.37, both feature gates were merged into one: `GenericWorkload`. Moreover, since workload-aware preemption
 became a beta graduation criterion for this KEP, the `WorkloadAwarePreemption` feature gate introduced by [KEP-5710]
-will also be merged into `GenericWorkload`. This means the lifecycle of workload-aware preemption will be directly tied
+was also merged into `GenericWorkload`. This means the lifecycle of workload-aware preemption is directly tied
 to the Workload API and gang scheduling features.
 
 However, this KEP and [KEP-5710] remain separate because they introduce different functionalities
@@ -1440,18 +1452,15 @@ We created integration tests to ensure the basic functionalities of gang schedul
 - Pods referencing a `PodGroup` (both gang and basic policies) are correctly processed via the Workload Scheduling 
   Cycle.
 - Deadlocks and livelocks do not occur when multiple gangs compete for resources.
-
-- Source code: https://github.com/kubernetes/kubernetes/blob/8822656b909c5a3cf74ae1fe90151c7a3e461157/test/integration/scheduler/podgroup/podgroup_test.go
-- Job: https://testgrid.k8s.io/sig-release-master-blocking#integration-master&include-filter-by-regex=scheduler.podgroup
-- Triage: https://storage.googleapis.com/k8s-triage/index.html?text=TestPodGroupScheduling&job=integration&test=scheduler
-
-With promoting to beta, we'll implement additional integration tests:
-
 - `PodGroup` is garbage collected when the replica is deleted
 - `PodGroup` queuing ensures that all available members are retrieved and processed correctly.
 - Deadlocks and livelocks do not occur when gangs interleave with individual pods.
 - Failed pod groups are requeued correctly and retry successfully when resources become available.
 - Scheduler correctly captures updated `minCount` value for pending pod groups, potentially unblocking them from PreEnqueue.
+
+- Source code: https://github.com/kubernetes/kubernetes/blob/8822656b909c5a3cf74ae1fe90151c7a3e461157/test/integration/scheduler/podgroup/podgroup_test.go
+- Job: https://testgrid.k8s.io/sig-release-master-blocking#integration-master&include-filter-by-regex=scheduler.podgroup
+- Triage: https://storage.googleapis.com/k8s-triage/index.html?text=TestPodGroupScheduling&job=integration&test=scheduler
 
 We also added benchmarks to measure the performance impact of these changes,xw in particular scheduling throughput
 of the workload scheduling with gang policy:
