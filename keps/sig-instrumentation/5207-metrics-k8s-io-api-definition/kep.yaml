@@ -4,7 +4,7 @@ authors:
   - "@tico88612"
 owning-sig: sig-instrumentation
 participating-sigs: []
-status: implementable
+status: implemented
 creation-date: "2026-02-24"
 reviewers:
   - "@rexagod"

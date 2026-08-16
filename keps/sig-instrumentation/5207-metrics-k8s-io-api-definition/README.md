@@ -47,8 +47,8 @@ Items marked with (R) are required *prior to targeting to a milestone / release*
 - [x] (R) Production readiness review completed
 - [x] (R) Production readiness review approved
 - [x] "Implementation History" section is up-to-date for milestone
-- [ ] User-facing documentation has been created in [kubernetes/website], for publication to [kubernetes.io]
-- [ ] Supporting documentation—e.g., additional design documents, links to mailing list discussions/SIG meetings, relevant PRs/issues, release notes
+- [x] User-facing documentation has been created in [kubernetes/website], for publication to [kubernetes.io]
+- [x] Supporting documentation—e.g., additional design documents, links to mailing list discussions/SIG meetings, relevant PRs/issues, release notes
 
 [kubernetes.io]: https://kubernetes.io/
 [kubernetes/enhancements]: https://git.k8s.io/enhancements
@@ -528,6 +528,7 @@ N/A
 
 - 2017.03.02: [v1alpha1 implemented](https://github.com/kubernetes/kubernetes/pull/41824)
 - 2017.09.06: [v1beta1 implemented](https://github.com/kubernetes/kubernetes/pull/51653)
+- 2026.07.11: [v1 implemented](https://github.com/kubernetes/kubernetes/pull/139223)
 
 ## Drawbacks
 
