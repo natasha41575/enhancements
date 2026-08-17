@@ -125,6 +125,9 @@ tags, and then generate with `hack/update-toc.sh`.
   - [Failures and Reconsideration of Deferred pods](#failures-and-reconsideration-of-deferred-pods)
     - [Failure Handler Adjustments for Deferred Pods](#failure-handler-adjustments-for-deferred-pods)
   - [Scope of Interaction with Workload-Aware Preemption](#scope-of-interaction-with-workload-aware-preemption)
+  - [Metrics and Events](#metrics-and-events)
+    - [Metrics](#metrics)
+    - [Events](#events)
   - [Test Plan](#test-plan)
       - [Prerequisite testing updates](#prerequisite-testing-updates)
       - [Unit tests](#unit-tests)
@@ -692,6 +695,23 @@ With workload-aware preemption, there are two scenarios to consider:
    * **Queueing Behavior for Group Members**: A running pod that requests a resize must be queued and retried individually. If the pod belongs to a `PodGroup`, the scheduling queue instead treats the deferred pod as an independent individual pod. In Alpha, this will be implemented by having `isPodGroupMember` return `false` for deferred resize pods, allowing them to follow the standard individual queueing and backoff pathways.
    * **Alpha Scope**: The resizing pod is evaluated individually for preemption victim selection on its assigned node. The scheduler does not proactively trigger group-wide rescheduling or preemption of other members of the workload group.
    * **Beta Graduation**: Co-existence mechanics, including group-wide coordinated preemption (e.g., preempting other members of the same workload to balance resource usage or preventing preemption if the workload's group-wide health is already degraded), will be fully designed and finalized prior to Beta.
+
+### Metrics and Events
+
+#### Metrics
+
+`kube-scheduler` currently exports several core preemption and queueing metrics (`preemption_attempts_total`, `preemption_victims`, and `pending_pods`). To distinguish between in-place resize preemption and initial placement preemption, we introduce an `operation` label to existing preemption metrics and add an analogous queue gauge:
+
+* `preemption_attempts_total`: Already-existing counter tracking total preemption attempts, with a new `operation` label (`initial_placement` or `pod_resize`).
+* `preemption_victims`: Already-existing histogram tracking the number of selected preemption victims, with a new `operation` label (`initial_placement` or `pod_resize`).
+* `deferred_resizing_pods`: New gauge tracking the number of pods with deferred resizes across scheduling queue pools, with a `queue` label (`active`, `backoff`, or `unschedulable`).
+
+#### Events
+
+Preemption events for in-place resize follow existing scheduler preemption conventions:
+
+* **Preemptor Pod**: Emits a `FailedScheduling` warning event when preemption cannot proceed, such as when node preemption policy disables preemption (`0/1 nodes are available: 1 node had resize preemption disabled.`) or when available victims cannot satisfy the resize deficit (`0/1 nodes are available: 1 Insufficient cpu.`). If the resize fits without preemption, the pod is parked in `unschedulablePods` without emitting warning events.
+* **Victim Pods**: Emits a `Preempted` normal event indicating the victim was evicted to accommodate the resizing pod (`Preempted by pod <namespace>/<name> on node <node-name>`), and sets the `DisruptionTarget` pod condition with reason `PreemptionByScheduler`.
 
 ### Test Plan
 
