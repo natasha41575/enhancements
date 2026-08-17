@@ -128,6 +128,7 @@ tags, and then generate with `hack/update-toc.sh`.
   - [Metrics and Events](#metrics-and-events)
     - [Metrics](#metrics)
     - [Events](#events)
+    - [Pod Status &amp; Conditions](#pod-status--conditions)
   - [Test Plan](#test-plan)
       - [Prerequisite testing updates](#prerequisite-testing-updates)
       - [Unit tests](#unit-tests)
@@ -712,6 +713,16 @@ Preemption events for in-place resize follow existing scheduler preemption conve
 
 * **Preemptor Pod**: Emits a `FailedScheduling` warning event when preemption cannot proceed, such as when node preemption policy disables preemption (`0/1 nodes are available: 1 node had resize preemption disabled.`) or when available victims cannot satisfy the resize deficit (`0/1 nodes are available: 1 Insufficient cpu.`). If the resize fits without preemption, the pod is parked in `unschedulablePods` without emitting warning events.
 * **Victim Pods**: Emits a `Preempted` normal event indicating the victim was evicted to accommodate the resizing pod (`Preempted by pod <namespace>/<name> on node <node-name>`), and sets the `DisruptionTarget` pod condition with reason `PreemptionByScheduler`.
+
+#### Pod Status & Conditions
+
+We decided not to expose a dedicated pod status condition surfacing the results of the preemption cycle for resizing pods. There is currently no concrete use case requiring this condition, and omitting it avoids bloating the already complex pod status and generating unnecessary API churn. This is analogous to how scheduler preemption behaves today for initial pod placement, where the scheduler does not write a preemption-specific status condition on pending pods.
+
+External controllers (such as VPA or a custom node autoscaler) already observe `PodResizePending: True` (Reason: `Deferred`) on the pod status to determine that a resize is pending capacity. Controllers and cluster operators can configure the scheduler's resize preemption behavior via the new node-level `podPreemptionPolicy` field. For example, if a controller can scale down another pod to free up capacity or increase capacity of the node itself, this would be preferred over eviction; the controller can use `podPreemptionPolicy` to disable resize preemption, and dynamically reenable it only when it needs help from the scheduler to free up capacity. Therefore, the `podPreemptionPolicy` field covers the known integration needs for external controllers.
+
+For user observability, users can inspect preemption blockers via standard `kubectl describe pod` event streams, where `FailedScheduling` warning events detail why preemption was blocked or could not find sufficient capacity. Users can also observe the `PodResizePending` condition to infer the current pod resize status. This is analogous to user-observability today for initial pod placement, where users can inspect `FailedScheduling` events to see why a pod couldn't be scheduled and the `PodScheduled` condition to infer if the pod is still pending.
+
+One can imagine a controller wanting the scheduler to proactively preempt for a resize, and react accordingly. However, we do not currently have a concrete use-case requiring this, and so we will consider introducing such a condition as a future enhancement if a clear requirement arises that is not addressed by our existing mechanisms.
 
 ### Test Plan
 
