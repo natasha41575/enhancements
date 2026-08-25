@@ -111,7 +111,7 @@ tags, and then generate with `hack/update-toc.sh`.
       - [Memory Attribution &amp; cgroup Limits](#memory-attribution--cgroup-limits)
       - [Sharing Volumes Between Multiple Containers](#sharing-volumes-between-multiple-containers)
       - [Init Container Lifecycles &amp; Handoff](#init-container-lifecycles--handoff)
-    - [Priority of Enforcement](#priority-of-enforcement)
+      - [Priority of Enforcement](#priority-of-enforcement)
     - [Order of Actuation](#order-of-actuation)
       - [Asynchronous Updates or Opposite Directions](#asynchronous-updates-or-opposite-directions)
       - [Actuation Priority Matrix](#actuation-priority-matrix)
@@ -119,20 +119,24 @@ tags, and then generate with `hack/update-toc.sh`.
     - [Volume Manager interface](#volume-manager-interface)
     - [The Role of the Container Runtime](#the-role-of-the-container-runtime)
   - [Shrinkage Safety](#shrinkage-safety)
-    - [Alpha](#alpha)
-    - [Beta](#beta)
+    - [Existing Cgroup Validation](#existing-cgroup-validation)
+    - [Volume-level safety](#volume-level-safety)
     - [emptyDir Size Limit Monitoring and Eviction](#emptydir-size-limit-monitoring-and-eviction)
   - [Interaction with Ephemeral Storage: Resource Accounting and Eviction](#interaction-with-ephemeral-storage-resource-accounting-and-eviction)
   - [Interaction with Secrets, Projected Volumes, and DownwardAPI](#interaction-with-secrets-projected-volumes-and-downwardapi)
     - [ConfigMaps](#configmaps)
+  - [Instrumentation](#instrumentation)
+    - [<code>volume_requested_resizes_total</code>](#volume_requested_resizes_total)
+    - [<code>pod_resize_duration_milliseconds</code>](#pod_resize_duration_milliseconds)
+    - [Resize Lifecycle Events](#resize-lifecycle-events)
   - [Test Plan](#test-plan)
       - [Prerequisite testing updates](#prerequisite-testing-updates)
       - [Unit tests](#unit-tests)
       - [Integration tests](#integration-tests)
       - [e2e tests](#e2e-tests)
   - [Graduation Criteria](#graduation-criteria)
-    - [Alpha](#alpha-1)
-    - [Beta](#beta-1)
+    - [Alpha](#alpha)
+    - [Beta](#beta)
     - [GA](#ga)
   - [Upgrade / Downgrade Strategy](#upgrade--downgrade-strategy)
     - [Upgrade](#upgrade)
@@ -271,9 +275,9 @@ API validation logic ensures that `Pod.Spec.Volumes[].EmptyDir.SizeLimit` is onl
 * The volume is memory-backed (meaning the `medium` field is set to `Memory`).
 * Updates occur through the `resize` subresource.
 
-Only modifications to an existing `Pod.Spec.Volumes[].EmptyDir.SizeLimit` are permitted.
+Only modifications to the `sizeLimit` of existing memory-backed volumes are permitted:
 * The addition or removal of a memory-backed volume in a pod spec is forbidden. 
-* For Alpha, adding or removing a `sizeLimit` to an existing memory-backed volume is not allowed. This boundary is re-evaluated for Beta.
+* Adding or removing a `sizeLimit` to an existing memory-backed volume is supported.
 
 #### Resize Restart Policy 
 
@@ -377,13 +381,15 @@ Init containers are commonly used to pre-populate a memory-backed volume (e.g., 
 2. **Termination**: When the Init container exits and its cgroup is cleaned up, the files remain in the memory volume. The memory usage of these files continues to count against the overall **Pod cgroup memory limit**.
 3. **App Container Handoff**: When the primary application container starts, it can read the pre-populated data. Under standard memory accounting rules, simply reading pre-existing files does not charge that memory to the app container's individual limit. The app container can use the cache without it counting toward its own limit (it only consumes Pod-level cgroup headroom).
  
-#### Priority of Enforcement
+##### Priority of Enforcement
 
 The volume `sizeLimit` acts as a safety "inner boundary" to ensure volume growth does not starve the container's processes of execution RAM. Ideally, `sizeLimit` is lower than the container's memory limit.
 
-Kubernetes does not strictly enforce this "lower-than" relationship, allowing users to set a `sizeLimit` exceeding the pod's memory limits or shrink pod memory limits below the volume `sizeLimit`. In these cases:
-*   The Kubelet does not block the resize but issues a **Warning Event**.
-*   If `sizeLimit` > cgroup memory limits, the volume's `ENOSPC` protection is effectively disabled, as the container is OOM-killed before the volume quota is reached. This is consistent with what pod creation permits today (see [Restricting sizeLimit to not exceed memory limits](#restricting-sizelimit-to-not-exceed-memory-limits)).
+When mounting or resizing a memory-backed volume, the Kubelet today computes the actual mounted `tmpfs` capacity as:
+$$\text{capacity} = \min(\text{NodeAllocatableMemory}, \text{PodMemoryLimit}, \text{VolumeSizeLimit})$$
+
+* If `sizeLimit` is omitted (`nil` or `0`), the volume size defaults to the total pod memory limit (or node allocatable if pod limits are unset).
+* If `sizeLimit` is specified and exceeds the total pod memory limit (e.g. 256Mi on a 200Mi pod), the mounted `tmpfs` volume capacity is capped to the total pod memory limit (200Mi). The Kubelet emits a `Warning VolumeSizeExceedsPodMemoryLimit` event during admission.
 
 #### Order of Actuation
 
@@ -432,8 +438,8 @@ The `KuberuntimeManager` serves as the coordination layer that understands the n
 
 To support direct resizing from the `KuberuntimeManager` while maintaining separation of concerns, this proposal extends the Volume Manager and Volume Plugin interfaces:
 
-*   **VolumeManager Extension**: The `VolumeManager` interface is extended with `ResizeEphemeralVolume(pod *v1.Pod, volumeName string, newSize *resource.Quantity) error`. This allows the `KuberuntimeManager` to trigger volume operations synchronously at the correct time in its sync loop.
-*   **ResizableEphemeralVolumePlugin Interface**: A new optional interface `ResizableEphemeralVolumePlugin` is introduced in `pkg/volume/plugins.go`. Volume plugins that support online, synchronous resizing (in this case, the `emptyDir` plugin for memory-backed volumes) can implement this interface. The `VolumeManager` checks if the plugin for the volume implements this interface and delegates the call to it.
+*   **VolumeManager Extension**: The `VolumeManager` interface is extended with `ResizeEphemeralVolume(pod *v1.Pod, volumeName string) error`. This allows the `KuberuntimeManager` to trigger volume operations synchronously at the correct time in its sync loop.
+*   **ResizableEphemeralVolumePlugin Interface**: A new optional interface `ResizableEphemeralVolumePlugin` is introduced in `pkg/volume/plugins.go`. Volume plugins that support online, synchronous resizing (in this case, the `emptyDir` plugin for memory-backed volumes) can implement this interface: `ResizeEphemeralVolume(spec *volume.Spec, pod *v1.Pod) error`. The `VolumeManager` checks if the plugin for the volume implements this interface and delegates the call to it.
 
 This design allows `KuberuntimeManager` to act as the central orchestrator for resource updates (ensuring strict ordering with cgroups) while leaving the actual filesystem manipulation logic encapsulated within the volume plugins.
 
@@ -445,21 +451,23 @@ On startup, the container runtime helps to bind the Kubelet's host path into the
 
 ### Shrinkage Safety 
 
-In the existing `InPlacePodVerticalScaling` feature, a best-effort safety logic ensures that container memory limits are not decreased below usage.
+In the existing `InPlacePodVerticalScaling` feature, a best-effort safety logic ensures that container memory limits are not decreased below usage. We analogously validate the safety of volume size decreases.
 
-#### Alpha
-For Alpha, shrinkage safety checks for memory-backed volumes are out of scope. If a user attempts to shrink a volume below its current usage, `/bin/mount` fails at the kernel level (e.g. on modern Linux kernels using the `fsconfig` tmpfs mount API, returning `fsconfig() failed: tmpfs: Too small a size for current use.` with exit status 32). This error is propagated back to the Kubelet and surfaced in the `PodResizeInProgress` condition. The Kubelet will periodically retry the resize operation until it succeeds, is cancelled, or the Pod terminates.
+#### Existing Cgroup Validation
 
-#### Beta
-For Beta, we will leverage and align with the Kubelet's existing resource validation framework to prevent OOMs:
-*   **Existing Cgroup Validation**: The Kubelet already contains validation logic (in `validateMemoryResizeAction`) to ensure that proposed cgroup limit reductions do not fall below active memory usage. We will leverage this check:
-    *   **Container-level Validation**: Ensures the proposed container memory limit is not decreased below its current container cgroup usage. Note that this check is insufficient if dynamic kernel-level page charge migration has temporarily shifted memory charges to another container (see [Memory Attribution & cgroup Limits](#memory-attribution--cgroup-limits)).
-    *   **Pod-level Validation**: For pods with enforced Pod-level cgroup limits (e.g., pods with pod-level limits specified, Guaranteed pods, or Burstable pods where all containers specify limits), the Kubelet validates the proposed aggregate Pod limit against the Pod-level cgroup usage. This acts as a reliable backstop since it compares against the aggregate memory footprint regardless of charge migration.
-*   **Volume-level Safety Options**: For shrinking the volume `sizeLimit` itself, we will consider one of two options (to be finalized prior to Beta):
-    1.  **Error Reporting Enhancement**: Assume the generic kernel error implies that the volume size limit shrink failed because the volume usage exceeds the new desired limit, and provide a custom error message in the `PodResizeInProgress` condition.
-    2.  **Active Pre-Resize Validation**: Actually add an additional validation check in `KuberuntimeManager` that compares the actual bytes stored in the volume against the new desired `sizeLimit` before attempting the remount. If this check fails, the Kubelet will block the resize. This check is subject to a TOCTOU (time-of-check to time-of-use) race condition.
+The Kubelet already contains validation logic (in `validateMemoryResizeAction`) to ensure that proposed cgroup limit reductions do not fall below active memory usage. We will leverage this check:
+* **Container-level Validation**: Ensures the proposed container memory limit is not decreased below its current container cgroup usage. Note that this check is insufficient if dynamic kernel-level page charge migration has temporarily shifted memory charges to another container (see [Memory Attribution & cgroup Limits](#memory-attribution--cgroup-limits)).
+* **Pod-level Validation**: For pods with enforced Pod-level cgroup limits (e.g., pods with pod-level limits specified, Guaranteed pods, or Burstable pods where all containers specify limits), the Kubelet validates the proposed aggregate Pod limit against the Pod-level cgroup usage. This acts as a reliable backstop since it compares against the aggregate memory footprint regardless of charge migration.
 
-The Kubelet will periodically retry the resize operation until it succeeds, is cancelled, or the Pod terminates.
+#### Volume-level safety
+
+If a user attempts to shrink a volume below its current usage, `/bin/mount` fails at the kernel level (e.g. on modern Linux kernels using the `fsconfig` tmpfs mount API, returning `fsconfig() failed: tmpfs: Too small a size for current use.` with exit status 32).
+
+The Kubelet does not perform string parsing on mount error output to distinguish shrinkage failures from other mount errors. Any `/bin/mount` remount failure is returned directly by `ResizeEphemeralVolume` to `KuberuntimeManager`, which exposes it to the user:
+* In the `PodResizeInProgress` condition (`Status: True`, `Reason: Error`, with the raw mount error message).
+* In a `Warning ResizeError` event with the `podResourceSummary` JSON payload describing the observed resize state and error.
+
+The volume remains mounted at its previous capacity, running containers are unaffected (no container restarts), and the Kubelet periodically retries the resize operation on subsequent sync iterations until it succeeds, is cancelled, or the Pod terminates.
 
 #### emptyDir Size Limit Monitoring and Eviction
 
@@ -491,6 +499,36 @@ While projected volumes are out of scope for this KEP, we call out their behavio
 #### ConfigMaps
 
 At the time of writing, ConfigMaps are implemented using disk-backed volumes rather than `tmpfs`. This means that they are currently independent of the memory-backed volumes implementation. There is a pending action item to move it (see the [code comment here](https://github.com/kubernetes/kubernetes/blob/f8eb5197fa6554c565155f13ec085fc77b7e9625/pkg/volume/configmap/configmap.go#L172)), at which point they fall into the same category as Secrets and Projected Volumes described above.
+
+### Instrumentation
+
+#### `volume_requested_resizes_total`
+
+This is a new metric that tracks the total number of resize attempts observed by the Kubelet, counted at the volume level. A single pod update changing multiple volumes will increment the counter once for each modified volume.
+
+Labels:
+- `medium`: The storage medium of the volume (e.g. `memory`).
+- `operation`: Whether the resize is an increase, decrease, addition, or removal of the size limit. Possible values: `increase`, `decrease`, `add`, or `remove`.
+
+This metric is recorded as a counter.
+
+#### `pod_resize_duration_milliseconds`
+
+This metric already exists in the Kubelet to track the duration of `doPodResizeAction`, and now also includes memory-backed volume resizes since that function is responsible for actuating both container cgroups and memory-backed volumes.
+
+This metric is recorded as a histogram.
+
+#### Resize Lifecycle Events
+
+The Kubelet emits lifecycle events for in-place pod resizes (`ResizeStarted`, `ResizeCompleted`, `ResizeError`). The event payload (`podResourceSummary`) is extended to include memory-backed `volumes` alongside containers:
+
+```json
+{
+  "containers": [...],
+  "volumes": [{"name": "mem-vol", "emptyDir": {"medium": "Memory", "sizeLimit": "128Mi"}}],
+  "generation": 2
+}
+```
 
 ### Test Plan
 
@@ -557,20 +595,20 @@ Below are some examples to consider, in addition to the aforementioned [maturity
 -->
 
 #### Alpha
-- The feature is implemented behind the `InPlacePodVerticalScalingMemoryBackedVolumes` feature gate.
-- Unit test coverage is complete.
-- E2E tests implemented in CI verify successful upsize and downsize operations in a live cluster.
+- [X] The feature is implemented behind the `InPlacePodVerticalScalingMemoryBackedVolumes` feature gate.
+- [X] Unit test coverage is complete.
+- [X] E2E tests implemented in CI verify successful upsize and downsize operations in a live cluster.
 
 #### Beta
-- Gather feedback from users.
-- Metrics are defined and implemented.
-- Kubelet emits a warning event when `sizeLimit` exceeds pod-level memory limits.
-- The plan evaluates whether integration tests are required.
-- Edge cases around "shrinkage safety" are resolved (e.g., reporting distinct errors when attempting to shrink a volume below current usage).
+- [ ] Gather feedback from users.
+- [ ] Metrics are defined and implemented.
+- [ ] Kubelet emits a warning event when `sizeLimit` exceeds pod-level memory limits.
+- [X] The plan evaluates whether integration tests are required.
+- [X] Edge cases around "shrinkage safety" are resolved.
 
 #### GA
-- The feature is stable in Beta and enabled by default for at least one release.
-- Critical bugs discovered during the Beta phase are resolved.
+- [ ] The feature is stable in Beta and enabled by default for at least one release.
+- [ ] Critical bugs discovered during the Beta phase are resolved.
 
 <!--
 
@@ -596,7 +634,12 @@ If the control plane rolls back to a previous version where the feature is disab
 ### Version Skew Strategy
 
 #### Kubelet vs API Server
+
 If the API Server supports the feature but the target Kubelet does not, the `NodeDeclaredFeatures` framework rejects the resize request during admission.
+
+Adding or removing `sizeLimits` is not supported in Alpha, but is planned for Beta.
+
+If N-1 Kubelet supports an Alpha version of the feature, but the API server is upgraded to support the Beta version of the feature, the API server will permit `add` / `remove` of the `sizeLimit` field on memory-backed volumes. Due to Kubelet implementation details in N-1, add operations will succeed, but remove operations will be silently ignored until the Kubelet is upgraded.
 
 ## Production Readiness Review Questionnaire
 
@@ -755,6 +798,8 @@ checking if there are objects with field X set) may be a last resort. Avoid
 logs or events for this purpose.
 -->
 
+The Kubelet exposes the Prometheus metric `volume_requested_resizes_total` with label `medium="memory"`. Operators can query this metric to track the total count of memory-backed volume resize requests processed across the cluster.
+
 ###### How can someone using this feature know that it is working for their instance?
 
 <!--
@@ -766,13 +811,13 @@ and operation of this feature.
 Recall that end users cannot usually observe component logs or access metrics.
 -->
 
-- [ ] Events
-  - Event Reason: 
-- [ ] API .status
-  - Condition name: 
-  - Other field: 
-- [ ] Other (treat as last resort)
-  - Details:
+- [X] Events
+  - Event Reason: `ResizeStarted` (emitted when kubelet accepts a resize request, along with the new requested size)
+  - Event Reason: `ResizeCompleted` (emitted when kubelet successfully resizes the volume)
+- [X] API .status
+  - Condition name: `PodResizeInProgress` (transitions to `True` during active resize and cleared upon successful completion)
+- [X] Other (treat as last resort)
+  - Details: Users can run `df` inside their container on the volume mount point to inspect the actual kernel-enforced mount size.
 
 ###### What are the reasonable SLOs (Service Level Objectives) for the enhancement?
 
@@ -791,18 +836,20 @@ These goals will help you determine what you need to measure (SLIs) in the next
 question.
 -->
 
+- Resize requests should succeed (`pod_resize_duration_milliseconds{"error=true"}` should be low)
+- Volume resize operations should complete quickly (`pod_resize_duration_milliseconds{error="false"}` < 3000ms for 99% of requests)
+
 ###### What are the SLIs (Service Level Indicators) an operator can use to determine the health of the service?
 
 <!--
 Pick one more of these and delete the rest.
 -->
 
-- [ ] Metrics
-  - Metric name:
-  - [Optional] Aggregation method:
-  - Components exposing the metric:
-- [ ] Other (treat as last resort)
-  - Details:
+- [X] Metrics
+  - Metric name: `pod_resize_duration_milliseconds`
+    - Components exposing the metric: Kubelet
+  - Metric name: `volume_requested_resizes_total`
+    - Components exposing the metric: Kubelet
 
 ###### Are there any missing metrics that would be useful to have to improve observability of this feature?
 
@@ -810,6 +857,8 @@ Pick one more of these and delete the rest.
 Describe the metrics themselves and the reasons why they weren't added (e.g., cost,
 implementation difficulties, etc.).
 -->
+
+None.
 
 ### Dependencies
 
@@ -833,6 +882,8 @@ and creating new ones, as well as about cluster-level services (e.g. DNS):
       - Impact of its outage on the feature:
       - Impact of its degraded performance or high-error rates on the feature:
 -->
+
+None.
 
 ### Scalability
 
@@ -966,6 +1017,10 @@ details). For now, we leave it here.
 
 ###### How does this feature react if the API server and/or etcd is unavailable?
 
+If the API server or etcd is unavailable, users will not be able to submit new resize requests. Existing requests will be processed by the Kubelet, but the pod status will not be updated with the resize status. 
+
+Once the API server or etcd is available again, new requests will be accepted and processed normally.
+
 ###### What are other known failure modes?
 
 <!--
@@ -981,7 +1036,17 @@ For each of them, fill in the following information by copying the below templat
     - Testing: Are there any tests for failure mode? If not, describe why.
 -->
 
+- **Volume shrinkage below current in-use memory**:
+  - **Detection**: The `PodResizeInProgress` condition in pod status is set to `Status: True`, `Reason: Error` with a message from the mount failure (e.g., `tmpfs: Too small a size for current use.`), and a `Warning ResizeError` event is emitted on the pod.
+  - **Mitigations**: Running containers are unaffected (0 container restarts) and the volume remains mounted at its previous capacity. The workload can delete files to reduce usage, or the user/autoscaler can update the pod spec with a higher `sizeLimit` or cancel the resize.
+  - **Diagnostics**: Kubelet logs at `v=2` with `Resizing emptyDir volume` and mount error details.
+  - **Testing**: Covered by unit tests in `pkg/volume/emptydir` and node E2E tests verifying retry behavior and condition reporting on shrink failures.
+
 ###### What steps should be taken if SLOs are not being met to determine the problem?
+
+- Inspect the `PodResizeInProgress` condition and Pod warning events (`ResizeError`, `VolumeSizeExceedsPodMemoryLimit`).
+- Check Kubelet logs for volume remount failures or container runtime cgroup update errors.
+- Query Kubelet metrics: `volume_requested_resizes_total` and `pod_resize_duration_milliseconds`.
 
 ## Implementation History
 
@@ -998,6 +1063,7 @@ Major milestones might include:
 
 - **2026-04-30**: Initial alpha KEP submitted.
 - **2026-08-25**: Correct the alpha KEP based on what was actually implemented.
+- **2026-09-01**: Update KEP for Beta graduation in 1.38.
 
 ## Drawbacks
 
